@@ -1,0 +1,160 @@
+# agent-framework-remote-openai on Hyperlight (python-agent-driver / pyhl stack)
+#
+# A Microsoft Agent Framework agent that calls a REMOTE OpenAI model
+# (or any OpenAI-compatible endpoint) over the network from inside a micro-VM,
+# using the shipped python-agent-driver + `pyhl` stack (warmed-interpreter
+# snapshot + host-proxied sockets). The driver kernel/rootfs already include
+# networking + hostfs, so no custom kernel build is needed.
+#
+# Uses the in-repo `pyhl` by default via `cargo run`; set PYHL=/path/to/pyhl to
+# use an installed binary instead.
+#
+# just build   - Fetch the shipped driver kernel from GHCR
+# just rootfs  - Build the initrd: shipped driver rootfs + agent-framework-core
+# just setup   - One-time: warm a Python snapshot (pyhl setup) with ./workspace mounted at /host
+# just smoke   - Phase 2: verify guest can read/write /host (no OpenAI key)
+# just deps    - Host venv in workspace/testbed (.venv) with pytest + package
+# just run     - Phase 3/4: SWE agent + host bash proxy (needs OPENAI_API_KEY + deps)
+# just eval    - Phase 5: host-side score (pytest + diff + reproduce checks)
+# just clean   - Remove build/snapshot artifacts (keeps ./workspace testbed)
+#
+# Token: set OPENAI_API_KEY on the host. pyhl passes it into the guest with
+# `--env OPENAI_API_KEY` without writing it to disk.
+# Optional: OPENAI_MODEL, OPENAI_BASE_URL, OPENAI_ENDPOINT,
+# OPENAI_MAX_COMPLETION_TOKENS, OPENAI_REASONING_EFFORT, OPENAI_NET_ALLOW,
+# OPENAI_MAX_TOOL_ROUNDS (default 40 for SWE).
+#
+# Phase 1 layout expected under ./workspace (mounted at guest /host):
+#   workspace/issue.md
+#   workspace/testbed/   # SWE-bench repo at base_commit
+#
+# Bash: guest has no shell. `just run` starts host_bash_proxy.py which executes
+# commands via workspace/.bash_rpc/ (cwd confined to workspace). The proxy
+# prepends workspace/testbed/.venv/bin to PATH when present — run `just deps`
+# once so `python3 -m pytest` / `pytest` work (system often has no pytest).
+
+set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
+export DOCKER_BUILDKIT := "0"
+
+kernel      := ".unikraft/build/agent-framework-remote-openai-driver_hyperlight-x86_64"
+initrd      := "agent-framework-remote-openai-initrd.cpio"
+image       := "agent-framework-remote-openai-cpio"
+home        := ".pyhl"
+pyhl        := env_var_or_default("PYHL", "cargo run --manifest-path ../../host/Cargo.toml --bin pyhl --")
+ghcr_kernel := "ghcr.io/hyperlight-dev/hyperlight-unikraft/python-agent-driver-kernel:latest"
+net_allow   := env_var_or_default("OPENAI_NET_ALLOW", "api.openai.com")
+workspace   := "workspace"
+
+# Fetch the shipped driver kernel from GHCR (has networking + hostfs).
+build:
+    mkdir -p {{parent_directory(kernel)}}
+    - docker rm -f {{image}}-kernel-tmp
+    docker create --name {{image}}-kernel-tmp {{ghcr_kernel}} /kernel
+    docker cp {{image}}-kernel-tmp:/kernel ./{{kernel}}
+    docker rm -f {{image}}-kernel-tmp
+
+# Augment the shipped driver rootfs with agent-framework-core.
+rootfs:
+    docker build --platform linux/amd64 --pull --target cpio -t {{image}} .
+    - docker rm -f {{image}}-tmp
+    docker create --name {{image}}-tmp {{image}} /bin/true
+    docker cp {{image}}-tmp:/output.cpio ./{{initrd}}
+    docker rm -f {{image}}-tmp
+
+# One-time: warm up + persist a Python snapshot (pyhl setup).
+# --mount is baked into the snapshot guest path (/host); run must use the same guest path.
+[unix]
+setup:
+    mkdir -p {{workspace}}
+    {{pyhl}} setup --from . --dest {{home}} --force --mount {{workspace}}
+
+# Phase 2: confirm hostfs mount works (reads issue.md + testbed, writes a marker).
+[unix]
+smoke:
+    test -f {{workspace}}/issue.md
+    test -d {{workspace}}/testbed
+    {{pyhl}} run --dest {{home}} smoke_hostfs.py --mount {{workspace}}
+
+# Host-side Python env for the bash tool (pytest + editable install of testbed).
+[unix]
+deps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -d {{workspace}}/testbed
+    python3 -m venv {{workspace}}/testbed/.venv
+    {{workspace}}/testbed/.venv/bin/pip install -U pip
+    {{workspace}}/testbed/.venv/bin/pip install -e {{workspace}}/testbed -r {{workspace}}/testbed/requirements-dev.txt
+    {{workspace}}/testbed/.venv/bin/python -m pytest --version
+    echo "deps OK: use just run (proxy puts .venv/bin on PATH)"
+
+# Quick host check that bash-proxy-style pytest works.
+[unix]
+test-host:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -x {{workspace}}/testbed/.venv/bin/python || { echo "run: just deps" >&2; exit 1; }
+    cd {{workspace}}/testbed && .venv/bin/python -m pytest -q tests/features/shlex_join_test.py
+
+# Phase 5: evaluate agent edits on the host (no Hyperlight / no API key).
+[unix]
+eval:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -d {{workspace}}/testbed || { echo "missing workspace/testbed" >&2; exit 1; }
+    test -x {{workspace}}/testbed/.venv/bin/python || { echo "run: just deps" >&2; exit 1; }
+    python3 eval_host.py --workspace {{workspace}}
+
+# Phase 5 + full pytest suite (slower).
+[unix]
+eval-full:
+    python3 eval_host.py --workspace {{workspace}} --full-suite
+
+# Phase 3: SWE agent; host_bash_proxy runs bash for the guest `bash` tool.
+# Samples host CPU%/RSS for the pyhl process tree (+ bash proxy) → results/resources_*.json
+[unix]
+run:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "${OPENAI_API_KEY:-}" ]; then
+        echo "OPENAI_API_KEY must be set (e.g. export OPENAI_API_KEY=sk-...)" >&2
+        exit 1
+    fi
+    test -f {{workspace}}/issue.md
+    test -d {{workspace}}/testbed
+    if [ ! -x {{workspace}}/testbed/.venv/bin/python ]; then
+        echo "missing testbed venv — run: just deps" >&2
+        exit 1
+    fi
+    mkdir -p {{workspace}}/.bash_rpc/pending {{workspace}}/.bash_rpc/done results
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    resources_out="results/resources_${stamp}.json"
+    python3 host_bash_proxy.py --workspace {{workspace}} &
+    proxy_pid=$!
+    cleanup() { kill "$proxy_pid" 2>/dev/null || true; wait "$proxy_pid" 2>/dev/null || true; }
+    trap cleanup EXIT
+    sleep 0.3
+    python3 monitor_resources.py \
+        --out "$resources_out" \
+        --interval "${MONITOR_INTERVAL:-0.5}" \
+        --also-pid "$proxy_pid" \
+        --label-also bash_proxy \
+        --label-main hyperlight \
+        -- \
+        {{pyhl}} run --dest {{home}} agent.py \
+            --mount {{workspace}} \
+            --net-allow {{net_allow}} \
+            --env OPENAI_API_KEY \
+            --env OPENAI_MODEL \
+            --env OPENAI_BASE_URL \
+            --env OPENAI_ENDPOINT \
+            --env OPENAI_MAX_COMPLETION_TOKENS \
+            --env OPENAI_REASONING_EFFORT \
+            --env OPENAI_MAX_TOOL_ROUNDS
+    echo "resources → $resources_out"
+
+rebuild: clean build rootfs setup
+
+# Keeps ./workspace (Phase 1 testbed + issue.md).
+[unix]
+clean:
+    rm -rf .unikraft {{initrd}} {{home}}

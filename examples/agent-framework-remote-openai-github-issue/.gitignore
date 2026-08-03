@@ -1,0 +1,9 @@
+.unikraft/
+agent-framework-remote-openai-initrd.cpio
+.pyhl/
+workspace/
+results/
+secrets/
+# Phase 2 smoke marker / bash RPC scratch (if workspace/ is tracked locally)
+workspace/.hyperlight_smoke_ok
+workspace/.bash_rpc/
