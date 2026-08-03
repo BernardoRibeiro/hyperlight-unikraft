@@ -61,6 +61,18 @@ rootfs:
     docker cp {{image}}-tmp:/output.cpio ./{{initrd}}
     docker rm -f {{image}}-tmp
 
+# create the agent shared environment
+[unix]
+shared-environment:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p {{workspace}}
+    cid=$(podman create docker.io/swerebench/sweb.eval.x86_64.asottile_1776_pyupgrade-939)
+    podman cp "$cid:testbed/issue.md" {{workspace}}/issue.md
+    podman cp "$cid:/testbed" {{workspace}}/testbed
+    podman rm "$cid"
+
+
 # One-time: warm up + persist a Python snapshot (pyhl setup).
 # --mount is baked into the snapshot guest path (/host); run must use the same guest path.
 [unix]
